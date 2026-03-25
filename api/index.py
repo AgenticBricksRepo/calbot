@@ -106,6 +106,16 @@ def stream_with_tools(messages):
     yield "done", (content, tcs)
 
 
+def _emit_group(items, single_type, batch_type, history):
+    if len(items) == 1:
+        tc = items[0]
+        yield sse(single_type, {"event": json.loads(tc["arguments"]),
+                  "tool_call_id": tc["id"], "tool_call": tc, "history": history})
+    elif len(items) > 1:
+        yield sse(batch_type, {"items": [{"event": json.loads(tc["arguments"]),
+                  "tool_call_id": tc["id"], "tool_call": tc} for tc in items], "history": history})
+
+
 def process_tool_calls(tcs, content, history, token):
     """Group tool calls, emit confirmations or auto-execute list queries."""
     groups = {"create_calendar_event": [], "delete_calendar_event": [], "list_upcoming_events": []}
@@ -120,17 +130,8 @@ def process_tool_calls(tcs, content, history, token):
         for tc in all_tcs]}
     updated = history + [hist_entry]
 
-    def emit_group(items, single_type, batch_type):
-        if len(items) == 1:
-            tc = items[0]
-            yield sse(single_type, {"event": json.loads(tc["arguments"]),
-                      "tool_call_id": tc["id"], "tool_call": tc, "history": updated})
-        elif len(items) > 1:
-            yield sse(batch_type, {"items": [{"event": json.loads(tc["arguments"]),
-                      "tool_call_id": tc["id"], "tool_call": tc} for tc in items], "history": updated})
-
-    yield from emit_group(groups["create_calendar_event"], "confirm", "confirm_batch")
-    yield from emit_group(groups["delete_calendar_event"], "confirm_delete", "confirm_delete_batch")
+    yield from _emit_group(groups["create_calendar_event"], "confirm", "confirm_batch", updated)
+    yield from _emit_group(groups["delete_calendar_event"], "confirm_delete", "confirm_delete_batch", updated)
 
     for tc in groups["list_upcoming_events"]:
         result = list_upcoming_events(**json.loads(tc["arguments"]), _token=token)
@@ -140,12 +141,25 @@ def process_tool_calls(tcs, content, history, token):
         follow_content, follow_tcs = "", {}
         for typ, payload in stream_with_tools([sys_msg()] + updated[-20:]):
             if typ == "tok":
+                follow_content += payload
                 yield sse("token", {"content": payload})
             else:
-                follow_content, follow_tcs = payload
+                _, follow_tcs = payload
 
         if follow_tcs:
-            yield from process_tool_calls(follow_tcs, follow_content, updated, token)
+            # Follow-up wants to call tools (e.g. delete after listing)
+            # Emit confirmations without re-streaming any text
+            follow_all = list(follow_tcs.values())
+            hist_entry2 = {"role": "assistant", "content": follow_content, "tool_calls": [
+                {"id": ft["id"], "type": "function",
+                 "function": {"name": ft["name"], "arguments": ft["arguments"]}}
+                for ft in follow_all]}
+            updated.append(hist_entry2)
+
+            f_creates = [ft for ft in follow_all if ft["name"] == "create_calendar_event"]
+            f_deletes = [ft for ft in follow_all if ft["name"] == "delete_calendar_event"]
+            yield from _emit_group(f_creates, "confirm", "confirm_batch", updated)
+            yield from _emit_group(f_deletes, "confirm_delete", "confirm_delete_batch", updated)
         else:
             updated.append({"role": "assistant", "content": follow_content})
             yield sse("done", {"history": updated})
