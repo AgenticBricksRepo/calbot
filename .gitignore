@@ -16,3 +16,6 @@ credentials.json
 
 # Local Claude settings
 .claude/
+
+# Playwright logs
+.playwright-mcp/

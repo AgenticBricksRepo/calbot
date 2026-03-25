@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, send_from_directory, Response, stream_with_context
+from flask import Flask, request, jsonify, send_from_directory, Response, redirect, session, stream_with_context
 from openai import OpenAI
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
@@ -7,6 +7,7 @@ import os
 import datetime
 
 app = Flask(__name__, static_folder="../public")
+app.secret_key = os.environ.get("SESSION_SECRET", "dev-secret-change-me")
 
 
 @app.route("/")
@@ -18,6 +19,172 @@ def index():
 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY", ""))
 TIMEZONE = os.environ.get("TIMEZONE", "America/Los_Angeles")
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
+TOKEN_PATH = os.path.join(os.path.dirname(__file__), "..", "token.json")
+
+
+# Allow OAuth over HTTP for local development
+if os.environ.get("FLASK_DEBUG") or os.environ.get("OAUTHLIB_INSECURE_TRANSPORT"):
+    os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
+
+
+# ── Auth endpoints ───────────────────────────────────────────────
+
+def _get_oauth_client_config():
+    """Load OAuth client config from credentials.json or env vars."""
+    creds_file = os.path.join(os.path.dirname(__file__), "..", "credentials.json")
+    if os.path.exists(creds_file):
+        with open(creds_file) as f:
+            return json.load(f)
+
+    client_id = os.environ.get("GOOGLE_CLIENT_ID")
+    client_secret = os.environ.get("GOOGLE_CLIENT_SECRET")
+    if client_id and client_secret:
+        return {
+            "web": {
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                "token_uri": "https://oauth2.googleapis.com/token",
+            }
+        }
+    return None
+
+
+def _load_creds_from_token_data(token_data):
+    """Build Credentials from a token dict."""
+    return Credentials(
+        token=token_data["token"],
+        refresh_token=token_data["refresh_token"],
+        token_uri=token_data["token_uri"],
+        client_id=token_data["client_id"],
+        client_secret=token_data["client_secret"],
+        scopes=SCOPES,
+    )
+
+
+def _refresh_if_needed(creds):
+    """Refresh credentials if expired, update session. Returns True if valid."""
+    if creds.valid:
+        return True
+    if creds.expired and creds.refresh_token:
+        creds.refresh(Request())
+        session["google_token"] = creds.to_json()
+        return True
+    return False
+
+
+@app.route("/api/auth/status")
+def auth_status():
+    """Check if valid Google Calendar credentials exist."""
+    # Check session cookie
+    token_str = session.get("google_token")
+    if token_str:
+        try:
+            token_data = json.loads(token_str)
+            creds = _load_creds_from_token_data(token_data)
+            if _refresh_if_needed(creds):
+                return jsonify({"authenticated": True})
+        except Exception:
+            pass
+
+    # Check token.json file (local dev)
+    if os.path.exists(TOKEN_PATH):
+        try:
+            creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
+            if creds.valid or (creds.expired and creds.refresh_token):
+                if creds.expired:
+                    creds.refresh(Request())
+                # Migrate file token to session
+                session["google_token"] = creds.to_json()
+                return jsonify({"authenticated": True})
+        except Exception:
+            pass
+
+    # Check GOOGLE_TOKEN env var (legacy Vercel support)
+    token_env = os.environ.get("GOOGLE_TOKEN")
+    if token_env:
+        try:
+            token_data = json.loads(token_env)
+            creds = _load_creds_from_token_data(token_data)
+            if _refresh_if_needed(creds):
+                return jsonify({"authenticated": True})
+        except Exception:
+            pass
+
+    return jsonify({"authenticated": False})
+
+
+def _get_redirect_uri():
+    """Get the OAuth redirect URI, preferring the one registered in credentials."""
+    client_config = _get_oauth_client_config()
+    if client_config:
+        # Use the first registered redirect URI from the credentials file
+        key = "web" if "web" in client_config else "installed"
+        uris = client_config.get(key, {}).get("redirect_uris", [])
+        if uris:
+            return uris[0]
+    return request.url_root.rstrip("/") + "/api/auth/callback"
+
+
+@app.route("/api/auth/login")
+def auth_login():
+    """Redirect to Google OAuth consent screen."""
+    from google_auth_oauthlib.flow import Flow
+
+    client_config = _get_oauth_client_config()
+    if not client_config:
+        return jsonify({"error": "No OAuth credentials configured. Add credentials.json or set GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET env vars."}), 500
+
+    redirect_uri = _get_redirect_uri()
+
+    flow = Flow.from_client_config(client_config, scopes=SCOPES, redirect_uri=redirect_uri)
+    auth_url, _ = flow.authorization_url(access_type="offline", prompt="consent")
+    return redirect(auth_url)
+
+
+@app.route("/api/auth/callback")
+def auth_callback():
+    """Handle OAuth callback, save token, redirect to app."""
+    from google_auth_oauthlib.flow import Flow
+
+    client_config = _get_oauth_client_config()
+    if not client_config:
+        return jsonify({"error": "No OAuth credentials configured."}), 500
+
+    redirect_uri = _get_redirect_uri()
+    flow = Flow.from_client_config(client_config, scopes=SCOPES, redirect_uri=redirect_uri)
+
+    # Replace 127.0.0.1 with localhost in the callback URL to match the registered redirect URI
+    auth_response = request.url
+    if "127.0.0.1" in redirect_uri:
+        auth_response = auth_response.replace("://localhost:", "://127.0.0.1:")
+    else:
+        auth_response = auth_response.replace("://127.0.0.1:", "://localhost:")
+    flow.fetch_token(authorization_response=auth_response)
+
+    creds = flow.credentials
+    session["google_token"] = creds.to_json()
+
+    # Also save to file for local dev convenience
+    try:
+        with open(TOKEN_PATH, "w") as f:
+            f.write(creds.to_json())
+    except OSError:
+        pass  # Serverless — can't write files, session cookie is enough
+
+    return redirect("/")
+
+
+@app.route("/api/auth/logout", methods=["POST"])
+def auth_logout():
+    """Clear token so user can re-authenticate."""
+    session.pop("google_token", None)
+    try:
+        if os.path.exists(TOKEN_PATH):
+            os.remove(TOKEN_PATH)
+    except OSError:
+        pass
+    return jsonify({"status": "ok"})
 
 SYSTEM_PROMPT = """You are CalBot, a sharp and friendly calendar assistant. You help the user manage their Google Calendar.
 
@@ -29,6 +196,8 @@ Rules:
 - ALWAYS include a useful description for events. Summarize the purpose of the event in 1-2 sentences.
 - When they ask about their schedule, call list_upcoming_events.
 - Be concise. After creating events, confirm with the details.
+- When the user wants to delete an event, first call list_upcoming_events to find it, then call delete_calendar_event with the event_id.
+- Before calling any tool, always include a brief acknowledgment message (1 sentence max). For example: "Sure, let me set that up!" or "Checking your schedule now."
 - When sharing links, ALWAYS use markdown format: [descriptive text](url). Never paste raw URLs."""
 
 tools = [
@@ -56,7 +225,7 @@ tools = [
         "type": "function",
         "function": {
             "name": "list_upcoming_events",
-            "description": "List upcoming events from Google Calendar.",
+            "description": "List upcoming events from Google Calendar. Returns event_id for each event which can be used to delete events.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -68,32 +237,49 @@ tools = [
             "strict": True,
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_calendar_event",
+            "description": "Delete an event from Google Calendar by its event_id. Always confirm with the user before calling this.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "event_id": {"type": "string", "description": "The Google Calendar event ID"},
+                    "summary": {"type": "string", "description": "The event title (for confirmation display)"},
+                },
+                "required": ["event_id", "summary"],
+                "additionalProperties": False,
+            },
+            "strict": True,
+        },
+    },
 ]
 
 
 def get_calendar_service():
     from googleapiclient.discovery import build
 
-    token_json = os.path.join(os.path.dirname(__file__), "..", "token.json")
+    creds = None
 
-    if os.path.exists(token_json):
-        creds = Credentials.from_authorized_user_file(token_json, SCOPES)
-        if creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-            with open(token_json, "w") as f:
-                f.write(creds.to_json())
-    else:
+    # 1. Session cookie (primary — works everywhere)
+    token_str = session.get("google_token")
+    if token_str:
+        token_data = json.loads(token_str)
+        creds = _load_creds_from_token_data(token_data)
+
+    # 2. token.json file (local dev fallback)
+    if not creds and os.path.exists(TOKEN_PATH):
+        creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
+
+    # 3. GOOGLE_TOKEN env var (legacy fallback)
+    if not creds:
         token_data = json.loads(os.environ["GOOGLE_TOKEN"])
-        creds = Credentials(
-            token=token_data["token"],
-            refresh_token=token_data["refresh_token"],
-            token_uri=token_data["token_uri"],
-            client_id=token_data["client_id"],
-            client_secret=token_data["client_secret"],
-            scopes=SCOPES,
-        )
-        if creds.expired and creds.refresh_token:
-            creds.refresh(Request())
+        creds = _load_creds_from_token_data(token_data)
+
+    if creds.expired and creds.refresh_token:
+        creds.refresh(Request())
+        session["google_token"] = creds.to_json()
 
     return build("calendar", "v3", credentials=creds)
 
@@ -139,6 +325,7 @@ def list_upcoming_events(days_ahead=7):
     return {
         "events": [
             {
+                "event_id": e["id"],
                 "summary": e.get("summary", "No title"),
                 "start": e["start"].get("dateTime", e["start"].get("date")),
                 "end": e["end"].get("dateTime", e["end"].get("date")),
@@ -149,9 +336,28 @@ def list_upcoming_events(days_ahead=7):
     }
 
 
+def delete_calendar_event(event_id, summary=""):
+    service = get_calendar_service()
+    try:
+        service.events().delete(calendarId="primary", eventId=event_id).execute()
+        return {
+            "status": "deleted",
+            "event_id": event_id,
+            "summary": summary,
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "event_id": event_id,
+            "summary": summary,
+            "error": str(e),
+        }
+
+
 FUNC_MAP = {
     "create_calendar_event": create_calendar_event,
     "list_upcoming_events": list_upcoming_events,
+    "delete_calendar_event": delete_calendar_event,
 }
 
 
@@ -210,74 +416,167 @@ def chat():
                             collected_tc[idx]["arguments"] += tc_chunk.function.arguments
 
         if collected_tc:
+            # Group tool calls by type
+            creates = []
+            deletes = []
+            lists = []
             for idx in sorted(collected_tc):
                 tc = collected_tc[idx]
-
                 if tc["name"] == "create_calendar_event":
-                    # Send confirmation to frontend — don't execute yet
-                    args = json.loads(tc["arguments"])
-                    # Add assistant message with tool calls to history
-                    tc_history_entry = {
-                        "role": "assistant",
-                        "content": content,
-                        "tool_calls": [
-                            {
-                                "id": tc["id"],
-                                "type": "function",
-                                "function": {"name": tc["name"], "arguments": tc["arguments"]},
-                            }
-                        ],
-                    }
-                    updated_history = history + [tc_history_entry]
-                    yield sse("confirm", {
-                        "event": args,
-                        "tool_call_id": tc["id"],
-                        "tool_call": tc,
-                        "history": updated_history,
-                    })
-
+                    creates.append(tc)
+                elif tc["name"] == "delete_calendar_event":
+                    deletes.append(tc)
                 elif tc["name"] == "list_upcoming_events":
+                    lists.append(tc)
+
+            # Build single history entry with ALL tool calls
+            all_tcs = creates + deletes + lists
+            all_tc_list = [
+                {
+                    "id": tc["id"],
+                    "type": "function",
+                    "function": {"name": tc["name"], "arguments": tc["arguments"]},
+                }
+                for tc in all_tcs
+            ]
+            tc_history_entry = {
+                "role": "assistant",
+                "content": content,
+                "tool_calls": all_tc_list,
+            }
+            updated_history = history + [tc_history_entry]
+
+            # Emit create confirmations
+            if len(creates) == 1:
+                tc = creates[0]
+                args = json.loads(tc["arguments"])
+                yield sse("confirm", {
+                    "event": args,
+                    "tool_call_id": tc["id"],
+                    "tool_call": tc,
+                    "history": updated_history,
+                })
+            elif len(creates) > 1:
+                items = []
+                for tc in creates:
                     args = json.loads(tc["arguments"])
-                    result = list_upcoming_events(**args)
+                    items.append({"event": args, "tool_call_id": tc["id"], "tool_call": tc})
+                yield sse("confirm_batch", {
+                    "items": items,
+                    "history": updated_history,
+                })
 
-                    # Build history with tool call + result
-                    tc_history_entry = {
+            # Emit delete confirmations
+            if len(deletes) == 1:
+                tc = deletes[0]
+                args = json.loads(tc["arguments"])
+                yield sse("confirm_delete", {
+                    "event": args,
+                    "tool_call_id": tc["id"],
+                    "tool_call": tc,
+                    "history": updated_history,
+                })
+            elif len(deletes) > 1:
+                items = []
+                for tc in deletes:
+                    args = json.loads(tc["arguments"])
+                    items.append({"event": args, "tool_call_id": tc["id"], "tool_call": tc})
+                yield sse("confirm_delete_batch", {
+                    "items": items,
+                    "history": updated_history,
+                })
+
+            # Auto-execute list_upcoming_events
+            for tc in lists:
+                args = json.loads(tc["arguments"])
+                result = list_upcoming_events(**args)
+
+                tool_result_entry = {
+                    "role": "tool",
+                    "tool_call_id": tc["id"],
+                    "content": json.dumps(result),
+                }
+                updated_history = updated_history + [tool_result_entry]
+                follow_messages = [sys_msg] + updated_history[-20:]
+
+                yield sse("tool_used", {"name": "list_upcoming_events"})
+
+                follow_stream = client.chat.completions.create(
+                    model="gpt-5-nano",
+                    messages=follow_messages,
+                    tools=tools,
+                    stream=True,
+                )
+                follow_content = ""
+                follow_tc = {}
+                for fchunk in follow_stream:
+                    fdelta = fchunk.choices[0].delta
+                    if fdelta.content:
+                        follow_content += fdelta.content
+                        yield sse("token", {"content": fdelta.content})
+                    if fdelta.tool_calls:
+                        for tc_chunk in fdelta.tool_calls:
+                            fidx = tc_chunk.index
+                            if fidx not in follow_tc:
+                                follow_tc[fidx] = {"id": "", "name": "", "arguments": ""}
+                            if tc_chunk.id:
+                                follow_tc[fidx]["id"] = tc_chunk.id
+                            if tc_chunk.function:
+                                if tc_chunk.function.name:
+                                    follow_tc[fidx]["name"] += tc_chunk.function.name
+                                if tc_chunk.function.arguments:
+                                    follow_tc[fidx]["arguments"] += tc_chunk.function.arguments
+
+                if follow_tc:
+                    # Process tool calls from the follow-up stream
+                    follow_creates = []
+                    follow_deletes = []
+                    for fidx in sorted(follow_tc):
+                        ftc = follow_tc[fidx]
+                        if ftc["name"] == "create_calendar_event":
+                            follow_creates.append(ftc)
+                        elif ftc["name"] == "delete_calendar_event":
+                            follow_deletes.append(ftc)
+
+                    all_follow_tc_list = [
+                        {
+                            "id": ftc["id"],
+                            "type": "function",
+                            "function": {"name": ftc["name"], "arguments": ftc["arguments"]},
+                        }
+                        for ftc in list(follow_tc.values())
+                    ]
+                    follow_history_entry = {
                         "role": "assistant",
-                        "content": content,
-                        "tool_calls": [
-                            {
-                                "id": tc["id"],
-                                "type": "function",
-                                "function": {"name": tc["name"], "arguments": tc["arguments"]},
-                            }
-                        ],
+                        "content": follow_content,
+                        "tool_calls": all_follow_tc_list,
                     }
-                    tool_result_entry = {
-                        "role": "tool",
-                        "tool_call_id": tc["id"],
-                        "content": json.dumps(result),
-                    }
-                    follow_history = history + [tc_history_entry, tool_result_entry]
-                    follow_messages = [sys_msg] + follow_history[-20:]
+                    updated_history.append(follow_history_entry)
 
-                    # Stream the follow-up response
-                    yield sse("tool_used", {"name": "list_upcoming_events"})
+                    if len(follow_creates) == 1:
+                        ftc = follow_creates[0]
+                        fargs = json.loads(ftc["arguments"])
+                        yield sse("confirm", {
+                            "event": fargs, "tool_call_id": ftc["id"],
+                            "tool_call": ftc, "history": updated_history,
+                        })
+                    elif len(follow_creates) > 1:
+                        items = [{"event": json.loads(ftc["arguments"]), "tool_call_id": ftc["id"], "tool_call": ftc} for ftc in follow_creates]
+                        yield sse("confirm_batch", {"items": items, "history": updated_history})
 
-                    follow_stream = client.chat.completions.create(
-                        model="gpt-5-nano",
-                        messages=follow_messages,
-                        tools=tools,
-                        stream=True,
-                    )
-                    follow_content = ""
-                    for fchunk in follow_stream:
-                        fdelta = fchunk.choices[0].delta
-                        if fdelta.content:
-                            follow_content += fdelta.content
-                            yield sse("token", {"content": fdelta.content})
-
-                    follow_history.append({"role": "assistant", "content": follow_content})
-                    yield sse("done", {"history": follow_history})
+                    if len(follow_deletes) == 1:
+                        ftc = follow_deletes[0]
+                        fargs = json.loads(ftc["arguments"])
+                        yield sse("confirm_delete", {
+                            "event": fargs, "tool_call_id": ftc["id"],
+                            "tool_call": ftc, "history": updated_history,
+                        })
+                    elif len(follow_deletes) > 1:
+                        items = [{"event": json.loads(ftc["arguments"]), "tool_call_id": ftc["id"], "tool_call": ftc} for ftc in follow_deletes]
+                        yield sse("confirm_delete_batch", {"items": items, "history": updated_history})
+                else:
+                    updated_history.append({"role": "assistant", "content": follow_content})
+                    yield sse("done", {"history": updated_history})
         else:
             history.append({"role": "assistant", "content": content})
             yield sse("done", {"history": history})
@@ -287,13 +586,14 @@ def chat():
 
 @app.route("/api/confirm", methods=["POST"])
 def confirm_event():
-    """User confirmed — actually create the event and stream GPT's follow-up."""
+    """User confirmed — actually execute the tool call and stream GPT's follow-up."""
     data = request.json
     history = data.get("history", [])
     tool_call = data.get("tool_call")
     args = json.loads(tool_call["arguments"])
 
-    result = create_calendar_event(**args)
+    func = FUNC_MAP[tool_call["name"]]
+    result = func(**args)
 
     history.append({
         "role": "tool",
@@ -305,8 +605,95 @@ def confirm_event():
     messages = [sys_msg] + history[-20:]
 
     def generate():
-        yield sse("tool_used", {"name": "create_calendar_event"})
+        yield sse("tool_used", {"name": tool_call["name"]})
 
+        stream = client.chat.completions.create(
+            model="gpt-5-nano",
+            messages=messages,
+            tools=tools,
+            stream=True,
+        )
+        content = ""
+        for chunk in stream:
+            delta = chunk.choices[0].delta
+            if delta.content:
+                content += delta.content
+                yield sse("token", {"content": delta.content})
+
+        history.append({"role": "assistant", "content": content})
+        yield sse("done", {"history": history})
+
+    return Response(generate(), mimetype="text/event-stream")
+
+
+@app.route("/api/confirm_batch", methods=["POST"])
+def confirm_batch():
+    """Execute multiple accepted tool calls and stream GPT's follow-up."""
+    data = request.json
+    history = data.get("history", [])
+    accepted = data.get("tool_calls", [])
+    rejected = data.get("rejected_tool_calls", [])
+
+    for tc in accepted:
+        args = json.loads(tc["arguments"])
+        func = FUNC_MAP[tc["name"]]
+        result = func(**args)
+        history.append({
+            "role": "tool",
+            "tool_call_id": tc["id"],
+            "content": json.dumps(result),
+        })
+
+    for tc in rejected:
+        history.append({
+            "role": "tool",
+            "tool_call_id": tc["id"],
+            "content": json.dumps({"status": "cancelled", "reason": "User declined."}),
+        })
+
+    sys_msg = build_system_message()
+    messages = [sys_msg] + history[-20:]
+
+    def generate():
+        yield sse("tool_used", {"name": accepted[0]["name"] if accepted else "batch"})
+
+        stream = client.chat.completions.create(
+            model="gpt-5-nano",
+            messages=messages,
+            tools=tools,
+            stream=True,
+        )
+        content = ""
+        for chunk in stream:
+            delta = chunk.choices[0].delta
+            if delta.content:
+                content += delta.content
+                yield sse("token", {"content": delta.content})
+
+        history.append({"role": "assistant", "content": content})
+        yield sse("done", {"history": history})
+
+    return Response(generate(), mimetype="text/event-stream")
+
+
+@app.route("/api/reject_batch", methods=["POST"])
+def reject_batch():
+    """Reject all tool calls in a batch."""
+    data = request.json
+    history = data.get("history", [])
+    tool_calls = data.get("tool_calls", [])
+
+    for tc in tool_calls:
+        history.append({
+            "role": "tool",
+            "tool_call_id": tc["id"],
+            "content": json.dumps({"status": "cancelled", "reason": "User declined."}),
+        })
+
+    sys_msg = build_system_message()
+    messages = [sys_msg] + history[-20:]
+
+    def generate():
         stream = client.chat.completions.create(
             model="gpt-5-nano",
             messages=messages,
