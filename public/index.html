@@ -192,6 +192,28 @@ body::before {
 .msg-bubble a:hover { color: var(--amber); }
 
 .msg-bubble strong { font-weight: 500; }
+.msg-bubble em { font-style: italic; }
+.msg-bubble code {
+  background: rgba(201,169,110,0.1);
+  padding: 1px 5px;
+  border-radius: 4px;
+  font-family: 'SF Mono', 'Fira Code', monospace;
+  font-size: 12px;
+}
+.msg-bubble pre {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin: 6px 0;
+  overflow-x: auto;
+}
+.msg-bubble pre code {
+  background: none;
+  padding: 0;
+  font-size: 12px;
+  line-height: 1.5;
+}
 
 /* tool badge */
 .tool-badge {
@@ -614,8 +636,29 @@ function handleKey(e) {
 function formatText(text) {
   return text
     .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    // code blocks
+    .replace(/```(\w*)\n?([\s\S]*?)```/g, '<pre><code>$2</code></pre>')
+    // inline code
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    // links
     .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>')
+    // bold + italic
+    .replace(/\*\*\*(.*?)\*\*\*/g, '<strong><em>$1</em></strong>')
+    // bold
     .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
+    // italic
+    .replace(/\*(.*?)\*/g, '<em>$1</em>')
+    // headers
+    .replace(/^### (.+)$/gm, '<strong style="font-size:13px;color:var(--amber)">$1</strong>')
+    .replace(/^## (.+)$/gm, '<strong style="font-size:14px;color:var(--amber)">$1</strong>')
+    .replace(/^# (.+)$/gm, '<strong style="font-size:15px;color:var(--amber)">$1</strong>')
+    // unordered lists
+    .replace(/^[-•] (.+)$/gm, '<span style="display:block;padding-left:12px">• $1</span>')
+    // ordered lists
+    .replace(/^(\d+)\. (.+)$/gm, '<span style="display:block;padding-left:12px">$1. $2</span>')
+    // horizontal rule
+    .replace(/^---$/gm, '<hr style="border:none;border-top:1px solid var(--border);margin:8px 0">')
+    // newlines (but not inside pre blocks)
     .replace(/\n/g, '<br>');
 }
 
