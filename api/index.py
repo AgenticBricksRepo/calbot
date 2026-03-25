@@ -138,17 +138,17 @@ def process_tool_calls(tcs, content, history, token):
         updated.append({"role": "tool", "tool_call_id": tc["id"], "content": json.dumps(result)})
         yield sse("tool_used", {"name": "list_upcoming_events"})
 
-        follow_content, follow_tcs = "", {}
+        follow_content, follow_tcs, buffered = "", {}, []
         for typ, payload in stream_with_tools([sys_msg()] + updated[-20:]):
             if typ == "tok":
                 follow_content += payload
-                yield sse("token", {"content": payload})
+                buffered.append(payload)
             else:
                 _, follow_tcs = payload
 
         if follow_tcs:
             # Follow-up wants to call tools (e.g. delete after listing)
-            # Emit confirmations without re-streaming any text
+            # Don't stream the follow-up text — just put it in history and show cards
             follow_all = list(follow_tcs.values())
             hist_entry2 = {"role": "assistant", "content": follow_content, "tool_calls": [
                 {"id": ft["id"], "type": "function",
@@ -161,6 +161,9 @@ def process_tool_calls(tcs, content, history, token):
             yield from _emit_group(f_creates, "confirm", "confirm_batch", updated)
             yield from _emit_group(f_deletes, "confirm_delete", "confirm_delete_batch", updated)
         else:
+            # No tool calls — stream all the buffered text
+            for t in buffered:
+                yield sse("token", {"content": t})
             updated.append({"role": "assistant", "content": follow_content})
             yield sse("done", {"history": updated})
 
