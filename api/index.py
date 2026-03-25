@@ -139,7 +139,10 @@ def auth_login():
     redirect_uri = _get_redirect_uri()
 
     flow = Flow.from_client_config(client_config, scopes=SCOPES, redirect_uri=redirect_uri)
-    auth_url, _ = flow.authorization_url(access_type="offline", prompt="consent")
+    auth_url, state = flow.authorization_url(access_type="offline", prompt="consent")
+    # Store the code_verifier for PKCE — needed in callback
+    session["oauth_state"] = state
+    session["code_verifier"] = flow.code_verifier
     return redirect(auth_url)
 
 
@@ -154,6 +157,8 @@ def auth_callback():
 
     redirect_uri = _get_redirect_uri()
     flow = Flow.from_client_config(client_config, scopes=SCOPES, redirect_uri=redirect_uri)
+    # Restore PKCE code_verifier from session
+    flow.code_verifier = session.pop("code_verifier", None)
 
     # Replace 127.0.0.1 with localhost in the callback URL to match the registered redirect URI
     auth_response = request.url
