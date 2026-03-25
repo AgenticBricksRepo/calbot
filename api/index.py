@@ -6,7 +6,8 @@ import json
 import os
 import datetime
 
-app = Flask(__name__, static_folder="../public")
+STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "public")
+app = Flask(__name__, static_folder=STATIC_DIR)
 app.secret_key = os.environ.get("SESSION_SECRET", "dev-secret-change-me")
 
 
