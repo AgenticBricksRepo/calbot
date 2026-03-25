@@ -30,7 +30,7 @@ Rules:
 - Be concise. After creating events, confirm with the details.
 - To delete an event, first call list_upcoming_events to find it, then call delete_calendar_event with the event_id.
 - Before calling any tool, include a brief acknowledgment (1 sentence max).
-- Use markdown formatting: **bold**, *italic*, `code`, lists (- item), and [links](url). Never paste raw URLs."""
+- Use markdown formatting. **Bold** important info like event names, dates, and times. Use lists for multiple items. Use [links](url) for calendar links. Never paste raw URLs."""
 
 TOOLS = [
     {"type": "function", "function": {
