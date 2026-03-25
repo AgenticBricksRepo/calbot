@@ -263,35 +263,45 @@ tools = [
 ]
 
 
-def get_calendar_service():
+def _get_token_str():
+    """Get token string from session, file, or env. Call within request context."""
+    token_str = session.get("google_token")
+    if token_str:
+        return token_str
+
+    if os.path.exists(TOKEN_PATH):
+        with open(TOKEN_PATH) as f:
+            return f.read()
+
+    token_env = os.environ.get("GOOGLE_TOKEN")
+    if token_env:
+        return token_env
+
+    return None
+
+
+def get_calendar_service(token_str=None):
     from googleapiclient.discovery import build
 
     creds = None
 
-    # 1. Session cookie (primary — works everywhere)
-    token_str = session.get("google_token")
+    if not token_str:
+        token_str = _get_token_str()
+
     if token_str:
         token_data = json.loads(token_str)
         creds = _load_creds_from_token_data(token_data)
-
-    # 2. token.json file (local dev fallback)
-    if not creds and os.path.exists(TOKEN_PATH):
-        creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
-
-    # 3. GOOGLE_TOKEN env var (legacy fallback)
-    if not creds:
-        token_data = json.loads(os.environ["GOOGLE_TOKEN"])
-        creds = _load_creds_from_token_data(token_data)
+    else:
+        raise Exception("No Google Calendar credentials found. Please reconnect.")
 
     if creds.expired and creds.refresh_token:
         creds.refresh(Request())
-        session["google_token"] = creds.to_json()
 
     return build("calendar", "v3", credentials=creds)
 
 
-def create_calendar_event(summary, start_datetime, end_datetime, description="", location=""):
-    service = get_calendar_service()
+def create_calendar_event(summary, start_datetime, end_datetime, description="", location="", _token=None):
+    service = get_calendar_service(token_str=_token)
     event = {
         "summary": summary,
         "start": {"dateTime": start_datetime, "timeZone": TIMEZONE},
@@ -312,8 +322,8 @@ def create_calendar_event(summary, start_datetime, end_datetime, description="",
     }
 
 
-def list_upcoming_events(days_ahead=7):
-    service = get_calendar_service()
+def list_upcoming_events(days_ahead=7, _token=None):
+    service = get_calendar_service(token_str=_token)
     now = datetime.datetime.utcnow()
     time_min = now.isoformat() + "Z"
     time_max = (now + datetime.timedelta(days=days_ahead)).isoformat() + "Z"
@@ -342,8 +352,8 @@ def list_upcoming_events(days_ahead=7):
     }
 
 
-def delete_calendar_event(event_id, summary=""):
-    service = get_calendar_service()
+def delete_calendar_event(event_id, summary="", _token=None):
+    service = get_calendar_service(token_str=_token)
     try:
         service.events().delete(calendarId="primary", eventId=event_id).execute()
         return {
@@ -401,6 +411,7 @@ def chat():
     history.append({"role": "user", "content": user_msg})
     sys_msg = build_system_message()
     messages = [sys_msg] + history[-20:]
+    token_str = _get_token_str()  # Extract before generator to avoid request context issue
 
     def generate():
       try:
@@ -509,7 +520,7 @@ def chat():
             # Auto-execute list_upcoming_events
             for tc in lists:
                 args = json.loads(tc["arguments"])
-                result = list_upcoming_events(**args)
+                result = list_upcoming_events(**args, _token=token_str)
 
                 tool_result_entry = {
                     "role": "tool",
@@ -615,8 +626,9 @@ def confirm_event():
     tool_call = data.get("tool_call")
     args = json.loads(tool_call["arguments"])
 
+    token_str = _get_token_str()
     func = FUNC_MAP[tool_call["name"]]
-    result = func(**args)
+    result = func(**args, _token=token_str)
 
     history.append({
         "role": "tool",
@@ -656,11 +668,12 @@ def confirm_batch():
     history = data.get("history", [])
     accepted = data.get("tool_calls", [])
     rejected = data.get("rejected_tool_calls", [])
+    token_str = _get_token_str()
 
     for tc in accepted:
         args = json.loads(tc["arguments"])
         func = FUNC_MAP[tc["name"]]
-        result = func(**args)
+        result = func(**args, _token=token_str)
         history.append({
             "role": "tool",
             "tool_call_id": tc["id"],
