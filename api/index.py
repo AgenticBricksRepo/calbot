@@ -371,6 +371,19 @@ def sse(event_type, data):
     return f"data: {json.dumps({'type': event_type, **data})}\n\n"
 
 
+def streaming_response(generator):
+    """Create an SSE response with headers to prevent buffering on Vercel."""
+    return Response(
+        generator,
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
+
+
 def build_system_message():
     today = datetime.date.today().strftime("%A, %B %d, %Y")
     return {"role": "system", "content": SYSTEM_PROMPT.format(today=today, tz=TIMEZONE)}
@@ -587,7 +600,7 @@ def chat():
             history.append({"role": "assistant", "content": content})
             yield sse("done", {"history": history})
 
-    return Response(generate(), mimetype="text/event-stream")
+    return streaming_response(generate())
 
 
 @app.route("/api/confirm", methods=["POST"])
@@ -629,7 +642,7 @@ def confirm_event():
         history.append({"role": "assistant", "content": content})
         yield sse("done", {"history": history})
 
-    return Response(generate(), mimetype="text/event-stream")
+    return streaming_response(generate())
 
 
 @app.route("/api/confirm_batch", methods=["POST"])
@@ -679,7 +692,7 @@ def confirm_batch():
         history.append({"role": "assistant", "content": content})
         yield sse("done", {"history": history})
 
-    return Response(generate(), mimetype="text/event-stream")
+    return streaming_response(generate())
 
 
 @app.route("/api/reject_batch", methods=["POST"])
@@ -716,7 +729,7 @@ def reject_batch():
         history.append({"role": "assistant", "content": content})
         yield sse("done", {"history": history})
 
-    return Response(generate(), mimetype="text/event-stream")
+    return streaming_response(generate())
 
 
 @app.route("/api/reject", methods=["POST"])
@@ -752,4 +765,4 @@ def reject_event():
         history.append({"role": "assistant", "content": content})
         yield sse("done", {"history": history})
 
-    return Response(generate(), mimetype="text/event-stream")
+    return streaming_response(generate())
