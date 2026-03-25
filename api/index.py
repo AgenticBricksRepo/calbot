@@ -403,6 +403,7 @@ def chat():
     messages = [sys_msg] + history[-20:]
 
     def generate():
+      try:
         stream = client.chat.completions.create(
             model="gpt-5-nano",
             messages=messages,
@@ -599,6 +600,9 @@ def chat():
         else:
             history.append({"role": "assistant", "content": content})
             yield sse("done", {"history": history})
+      except Exception as e:
+        yield sse("token", {"content": f"Error: {str(e)}"})
+        yield sse("done", {"history": history})
 
     return streaming_response(generate())
 
