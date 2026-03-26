@@ -202,9 +202,11 @@ def process_tool_calls(tcs, content, history, token):
     yield from _emit_group(groups["delete_calendar_event"], "confirm_delete", "confirm_delete_batch", updated)
 
     for tc in groups["list_upcoming_events"]:
+        yield sse("status", {"message": "Checking your calendar"})
         with _req_timer.span("list_upcoming_events (Google API)") if _req_timer else nullcontext():
             result = list_upcoming_events(**json.loads(tc["arguments"]), _token=token)
         updated.append({"role": "tool", "tool_call_id": tc["id"], "content": json.dumps(result)})
+        yield sse("status", {"message": "Preparing response"})
         yield sse("tool_used", {"name": "list_upcoming_events"})
 
         follow_content, follow_tcs, streamed_tokens = "", {}, []
@@ -437,12 +439,14 @@ def confirm_event():
     history, tc = data["history"], data["tool_call"]
     token = _token()
     timer = _req_timer
-    with timer.span(f"{tc['name']} (Google API)"):
-        result = FUNCS[tc["name"]](**json.loads(tc["arguments"]), _token=token)
-    history.append({"role": "tool", "tool_call_id": tc["id"], "content": json.dumps(result)})
+    status_label = {"create_calendar_event": "Creating event", "delete_calendar_event": "Deleting event"}.get(tc["name"], "Working")
     def generate():
         global _req_timer
         _req_timer = timer
+        yield sse("status", {"message": status_label})
+        with timer.span(f"{tc['name']} (Google API)"):
+            result = FUNCS[tc["name"]](**json.loads(tc["arguments"]), _token=token)
+        history.append({"role": "tool", "tool_call_id": tc["id"], "content": json.dumps(result)})
         yield sse("tool_used", {"name": tc["name"]})
         yield from stream_reply([sys_msg()] + history[-20:], history, label="confirm reply")
         timer.summary()
@@ -456,17 +460,21 @@ def confirm_batch():
     history = data["history"]
     token = _token()
     timer = _req_timer
-    for tc in data.get("tool_calls", []):
-        with timer.span(f"{tc['name']} (Google API)"):
-            r = FUNCS[tc["name"]](**json.loads(tc["arguments"]), _token=token)
-        history.append({"role": "tool", "tool_call_id": tc["id"], "content": json.dumps(r)})
-    for tc in data.get("rejected_tool_calls", []):
-        history.append({"role": "tool", "tool_call_id": tc["id"],
-                        "content": json.dumps({"status": "cancelled", "reason": "User declined."})})
+    tool_calls = data.get("tool_calls", [])
+    rejected = data.get("rejected_tool_calls", [])
     def generate():
         global _req_timer
         _req_timer = timer
-        yield sse("tool_used", {"name": data["tool_calls"][0]["name"] if data.get("tool_calls") else "batch"})
+        for i, tc in enumerate(tool_calls):
+            label = {"create_calendar_event": "Creating event", "delete_calendar_event": "Deleting event"}.get(tc["name"], "Working")
+            yield sse("status", {"message": f"{label} ({i+1}/{len(tool_calls)})" if len(tool_calls) > 1 else label})
+            with timer.span(f"{tc['name']} (Google API)"):
+                r = FUNCS[tc["name"]](**json.loads(tc["arguments"]), _token=token)
+            history.append({"role": "tool", "tool_call_id": tc["id"], "content": json.dumps(r)})
+        for tc in rejected:
+            history.append({"role": "tool", "tool_call_id": tc["id"],
+                            "content": json.dumps({"status": "cancelled", "reason": "User declined."})})
+        yield sse("tool_used", {"name": tool_calls[0]["name"] if tool_calls else "batch"})
         yield from stream_reply([sys_msg()] + history[-20:], history, label="batch reply")
         timer.summary()
     return sse_response(generate())

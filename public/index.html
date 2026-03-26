@@ -312,6 +312,25 @@ body::before {
 
 .confirm-btn:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
 
+/* ── Resolved card state ──────────────────────────── */
+.confirm-card.resolved .confirm-actions { display: none; }
+.confirm-card.resolved .confirm-inner { opacity: 0.6; }
+
+.confirm-resolved-badge {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 9px 16px;
+  font-size: 11px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  animation: msgIn 0.3s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+.confirm-resolved-badge.created { color: var(--green); }
+.confirm-resolved-badge.deleted { color: var(--red); }
+.confirm-resolved-badge.cancelled { color: var(--text-muted); }
+
 /* ── Typing indicator ───────────────────────────────── */
 .typing {
   align-self: flex-start;
@@ -512,6 +531,57 @@ body::before {
   background: var(--red); border-color: var(--red);
 }
 
+/* ── Status indicator ──────────────────────────────── */
+.status-indicator {
+  align-self: flex-start;
+  animation: msgIn 0.3s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 18px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 18px;
+  border-bottom-left-radius: 6px;
+  font-size: 13px;
+  font-weight: 400;
+  color: var(--text-muted);
+  letter-spacing: 0.01em;
+}
+
+.status-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--amber);
+  box-shadow: 0 0 8px rgba(201,169,110,0.4);
+  animation: statusPulse 1.5s ease-in-out infinite;
+}
+
+@keyframes statusPulse {
+  0%, 100% { opacity: 0.4; transform: scale(0.85); }
+  50% { opacity: 1; transform: scale(1.1); }
+}
+
+.status-text {
+  display: inline;
+}
+
+.status-text::after {
+  content: '';
+  animation: statusDots 1.5s steps(4, end) infinite;
+}
+
+@keyframes statusDots {
+  0% { content: ''; }
+  25% { content: '.'; }
+  50% { content: '..'; }
+  75% { content: '...'; }
+}
+
 /* ── Loading state ─────────────────────────────────── */
 .shell.loading .header,
 .shell.loading .messages,
@@ -695,6 +765,7 @@ function addMessage(text, role, toolNames) {
 
 function showTypingIndicator() {
   removeTypingIndicator();
+  removeStatusIndicator();
   const el = document.createElement('div');
   el.className = 'typing';
   el.id = 'typingIndicator';
@@ -705,6 +776,22 @@ function showTypingIndicator() {
 
 function removeTypingIndicator() {
   const el = document.getElementById('typingIndicator');
+  if (el) el.remove();
+}
+
+function showStatusIndicator(message) {
+  removeTypingIndicator();
+  removeStatusIndicator();
+  const el = document.createElement('div');
+  el.className = 'status-indicator';
+  el.id = 'statusIndicator';
+  el.innerHTML = `<div class="status-pill"><div class="status-dot"></div><span class="status-text">${message}</span></div>`;
+  messagesEl.appendChild(el);
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+}
+
+function removeStatusIndicator() {
+  const el = document.getElementById('statusIndicator');
   if (el) el.remove();
 }
 
@@ -846,8 +933,7 @@ async function confirmBatch(btn) {
 
   busy = false;
   sendBtn.disabled = !inputEl.value.trim();
-  card.style.opacity = '0.5';
-  card.querySelectorAll('.confirm-actions').forEach(a => a.style.display = 'none');
+  resolveCard(card, 'confirmed');
 }
 
 async function rejectBatch(btn) {
@@ -876,8 +962,7 @@ async function rejectBatch(btn) {
 
   busy = false;
   sendBtn.disabled = !inputEl.value.trim();
-  card.style.opacity = '0.5';
-  card.querySelectorAll('.confirm-actions').forEach(a => a.style.display = 'none');
+  resolveCard(card, 'cancelled');
 }
 
 async function streamResponse(response) {
@@ -900,8 +985,13 @@ async function streamResponse(response) {
       if (!line.startsWith('data: ')) continue;
       const data = JSON.parse(line.slice(6));
 
+      if (data.type === 'status') {
+        showStatusIndicator(data.message);
+      }
+
       if (data.type === 'token') {
         removeTypingIndicator();
+        removeStatusIndicator();
         if (!bubble) bubble = addStreamingBubble();
         bubbleText += data.content;
         bubble.innerHTML = (toolBadges.length ? toolBadges.join('') : '') + formatText(bubbleText);
@@ -919,21 +1009,25 @@ async function streamResponse(response) {
 
       if (data.type === 'confirm') {
         removeTypingIndicator();
+        removeStatusIndicator();
         addConfirmCard(data.event, data.tool_call, data.history);
       }
 
       if (data.type === 'confirm_delete') {
         removeTypingIndicator();
+        removeStatusIndicator();
         addDeleteCard(data.event, data.tool_call, data.history);
       }
 
       if (data.type === 'confirm_batch') {
         removeTypingIndicator();
+        removeStatusIndicator();
         addBatchConfirmCard(data.items, data.history, 'create');
       }
 
       if (data.type === 'confirm_delete_batch') {
         removeTypingIndicator();
+        removeStatusIndicator();
         addBatchConfirmCard(data.items, data.history, 'delete');
       }
 
@@ -973,14 +1067,34 @@ async function send() {
   inputEl.focus();
 }
 
+function resolveCard(card, type) {
+  const isDelete = card.classList.contains('delete');
+  const checkSvg = '<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>';
+  const xSvg = '<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
+
+  card.classList.add('resolved');
+
+  let badge;
+  if (type === 'confirmed') {
+    const label = isDelete ? 'Deleted' : 'Created';
+    const cls = isDelete ? 'deleted' : 'created';
+    badge = `<div class="confirm-resolved-badge ${cls}">${checkSvg} ${label}</div>`;
+  } else {
+    badge = `<div class="confirm-resolved-badge cancelled">${xSvg} Cancelled</div>`;
+  }
+
+  const inner = card.querySelector('.confirm-inner');
+  if (inner) inner.insertAdjacentHTML('beforeend', badge);
+}
+
 async function confirmEvent(btn) {
   const card = btn.closest('.confirm-card');
   const toolCall = JSON.parse(card.dataset.toolCall);
   const cardHistory = JSON.parse(card.dataset.history);
+  const isDelete = card.classList.contains('delete');
 
-  // Disable buttons
   card.querySelectorAll('.confirm-btn').forEach(b => b.disabled = true);
-  btn.textContent = 'Creating...';
+  btn.textContent = isDelete ? 'Deleting...' : 'Creating...';
 
   busy = true;
   showTypingIndicator();
@@ -993,15 +1107,11 @@ async function confirmEvent(btn) {
     await streamResponse(res);
   } catch (err) {
     removeTypingIndicator();
-    addMessage('Failed to create event.', 'bot');
+    addMessage(isDelete ? 'Failed to delete event.' : 'Failed to create event.', 'bot');
   }
   busy = false;
   sendBtn.disabled = !inputEl.value.trim();
-
-  // Collapse the card
-  card.style.opacity = '0.5';
-  card.querySelectorAll('.confirm-btn').forEach(b => b.style.display = 'none');
-  btn.style.display = 'none';
+  resolveCard(card, 'confirmed');
 }
 
 async function rejectEvent(btn) {
@@ -1026,9 +1136,7 @@ async function rejectEvent(btn) {
   }
   busy = false;
   sendBtn.disabled = !inputEl.value.trim();
-
-  card.style.opacity = '0.5';
-  card.querySelectorAll('.confirm-actions').forEach(a => a.style.display = 'none');
+  resolveCard(card, 'cancelled');
 }
 
 function clearChat() {
