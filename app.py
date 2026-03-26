@@ -9,4 +9,4 @@ load_dotenv()
 from api.index import app
 
 if __name__ == "__main__":
-    app.run(debug=True, host="localhost", port=5000)
+    app.run(debug=True, host="localhost", port=8001)

@@ -2,7 +2,9 @@ from flask import Flask, request, jsonify, send_from_directory, Response, redire
 from openai import OpenAI
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
-import json, os, datetime
+from googleapiclient.discovery import build
+import json, os, datetime, time, sys
+from contextlib import nullcontext
 
 # ── Setup ────────────────────────────────────────────────────────
 BASE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
@@ -13,24 +15,66 @@ app = Flask(__name__, static_folder=os.path.join(BASE_DIR, "public"))
 app.secret_key = os.environ.get("SESSION_SECRET", "dev-secret-change-me")
 llm = OpenAI(api_key=os.environ.get("OPENAI_API_KEY", ""))
 TZ = os.environ.get("TIMEZONE", "America/Los_Angeles")
-MODEL = "gpt-5-nano"
+MODEL = os.environ.get("MODEL", "gpt-4o-mini")
 
 if os.environ.get("FLASK_DEBUG") or os.environ.get("OAUTHLIB_INSECURE_TRANSPORT"):
     os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
 
-SYSTEM_PROMPT = """You are CalBot, a sharp and friendly calendar assistant. You help the user manage their Google Calendar.
+DEBUG_TIMING = os.environ.get("FLASK_DEBUG") or os.environ.get("OAUTHLIB_INSECURE_TRANSPORT")
 
-Today is {today}. The user's timezone is {tz}.
+# ── Timing ──────────────────────────────────────────────────────
 
-Rules:
-- When the user wants to create an event, extract ALL details and call create_calendar_event.
-- If they don't give a time, ask for it. Default duration is 1 hour.
-- ALWAYS include a useful description for events (1-2 sentences).
-- When they ask about their schedule, call list_upcoming_events.
-- Be concise. After creating events, confirm with the details.
-- To delete an event, first call list_upcoming_events to find it, then call delete_calendar_event with the event_id.
-- Before calling any tool, include a brief acknowledgment (1 sentence max).
-- Use markdown formatting. **Bold** important info like event names, dates, and times. Do NOT use bullet points or lists — write in short paragraphs or single lines. Use [links](url) for calendar links. Never paste raw URLs."""
+class RequestTimer:
+    """Collects timing spans for a single request and prints a summary."""
+    def __init__(self, label):
+        self.label = label
+        self.start = time.perf_counter()
+        self.spans = []
+
+    def span(self, name):
+        return TimerSpan(name, self)
+
+    def record(self, name, elapsed):
+        self.spans.append((name, elapsed))
+
+    def summary(self):
+        if not DEBUG_TIMING:
+            return
+        total = time.perf_counter() - self.start
+        print(f"\n\033[1;36m{'='*60}\033[0m", file=sys.stderr)
+        print(f"\033[1;36m  {self.label}  —  total {total:.2f}s\033[0m", file=sys.stderr)
+        print(f"\033[1;36m{'='*60}\033[0m", file=sys.stderr)
+        for name, elapsed in self.spans:
+            color = "\033[32m" if elapsed < 0.5 else "\033[33m" if elapsed < 2.0 else "\033[31m"
+            bar = "█" * min(int(elapsed * 10), 40)
+            print(f"  {color}{elapsed:6.2f}s\033[0m  {bar:40s}  {name}", file=sys.stderr)
+        print(f"\033[1;36m{'─'*60}\033[0m\n", file=sys.stderr)
+
+
+class TimerSpan:
+    def __init__(self, name, timer):
+        self.name = name
+        self.timer = timer
+    def __enter__(self):
+        self.t0 = time.perf_counter()
+        if DEBUG_TIMING:
+            print(f"  \033[90m▸ {self.name} …\033[0m", file=sys.stderr)
+        return self
+    def __exit__(self, *_):
+        elapsed = time.perf_counter() - self.t0
+        self.timer.record(self.name, elapsed)
+        if DEBUG_TIMING:
+            color = "\033[32m" if elapsed < 0.5 else "\033[33m" if elapsed < 2.0 else "\033[31m"
+            print(f"  {color}✓ {self.name}: {elapsed:.2f}s\033[0m", file=sys.stderr)
+        self.elapsed = elapsed
+
+_req_timer = None  # set per-request
+
+SYSTEM_PROMPT = """CalBot — calendar assistant. Today: {today}. Timezone: {tz}.
+
+Create events with create_calendar_event (ask for time if missing, default 1hr, always include a description).
+Check schedule with list_upcoming_events. Delete: list first, then delete_calendar_event.
+Brief acknowledgment before tool calls. **Bold** names/dates/times. Short paragraphs, no bullet points. Use [links](url)."""
 
 TOOLS = [
     {"type": "function", "function": {
@@ -73,28 +117,49 @@ def sys_msg():
     today = datetime.date.today().strftime("%A, %B %d, %Y")
     return {"role": "system", "content": SYSTEM_PROMPT.format(today=today, tz=TZ)}
 
-def stream_reply(messages, history):
+def stream_reply(messages, history, label="stream_reply"):
     """Simple LLM stream → SSE tokens → done."""
-    stream = llm.chat.completions.create(model=MODEL, messages=messages, tools=TOOLS, stream=True)
+    global _req_timer
+    t0 = time.perf_counter()
+    ttft = None
+    stream = llm.chat.completions.create(model=MODEL, messages=messages, stream=True)
     content = ""
     for chunk in stream:
         d = chunk.choices[0].delta
         if d.content:
+            if ttft is None:
+                ttft = time.perf_counter() - t0
+                if _req_timer:
+                    _req_timer.record(f"{label} TTFT", ttft)
             content += d.content
             yield sse("token", {"content": d.content})
+    total = time.perf_counter() - t0
+    if _req_timer:
+        _req_timer.record(f"{label} total", total)
     history.append({"role": "assistant", "content": content})
     yield sse("done", {"history": history})
 
-def stream_with_tools(messages):
+def stream_with_tools(messages, label="LLM call"):
     """Stream LLM, yield tokens and collect tool calls."""
-    stream = llm.chat.completions.create(model=MODEL, messages=messages, tools=TOOLS, tool_choice="auto", stream=True)
+    global _req_timer
+    t0 = time.perf_counter()
+    ttft = None
+    stream = llm.chat.completions.create(model=MODEL, messages=messages, tools=TOOLS, stream=True)
     content, tcs = "", {}
     for chunk in stream:
         d = chunk.choices[0].delta
         if d.content:
+            if ttft is None:
+                ttft = time.perf_counter() - t0
+                if _req_timer:
+                    _req_timer.record(f"{label} TTFT", ttft)
             content += d.content
             yield "tok", d.content
         if d.tool_calls:
+            if ttft is None:
+                ttft = time.perf_counter() - t0
+                if _req_timer:
+                    _req_timer.record(f"{label} TTFT (tool)", ttft)
             for tc in d.tool_calls:
                 i = tc.index
                 if i not in tcs:
@@ -103,6 +168,9 @@ def stream_with_tools(messages):
                 if tc.function:
                     if tc.function.name: tcs[i]["name"] += tc.function.name
                     if tc.function.arguments: tcs[i]["arguments"] += tc.function.arguments
+    total = time.perf_counter() - t0
+    if _req_timer:
+        _req_timer.record(f"{label} total", total)
     yield "done", (content, tcs)
 
 
@@ -134,21 +202,22 @@ def process_tool_calls(tcs, content, history, token):
     yield from _emit_group(groups["delete_calendar_event"], "confirm_delete", "confirm_delete_batch", updated)
 
     for tc in groups["list_upcoming_events"]:
-        result = list_upcoming_events(**json.loads(tc["arguments"]), _token=token)
+        with _req_timer.span("list_upcoming_events (Google API)") if _req_timer else nullcontext():
+            result = list_upcoming_events(**json.loads(tc["arguments"]), _token=token)
         updated.append({"role": "tool", "tool_call_id": tc["id"], "content": json.dumps(result)})
         yield sse("tool_used", {"name": "list_upcoming_events"})
 
-        follow_content, follow_tcs, buffered = "", {}, []
-        for typ, payload in stream_with_tools([sys_msg()] + updated[-20:]):
+        follow_content, follow_tcs, streamed_tokens = "", {}, []
+        for typ, payload in stream_with_tools([sys_msg()] + updated[-20:], label="follow-up LLM"):
             if typ == "tok":
                 follow_content += payload
-                buffered.append(payload)
+                yield sse("token", {"content": payload})
+                streamed_tokens.append(payload)
             else:
                 _, follow_tcs = payload
 
         if follow_tcs:
             # Follow-up wants to call tools (e.g. delete after listing)
-            # Don't stream the follow-up text — just put it in history and show cards
             follow_all = list(follow_tcs.values())
             hist_entry2 = {"role": "assistant", "content": follow_content, "tool_calls": [
                 {"id": ft["id"], "type": "function",
@@ -161,9 +230,7 @@ def process_tool_calls(tcs, content, history, token):
             yield from _emit_group(f_creates, "confirm", "confirm_batch", updated)
             yield from _emit_group(f_deletes, "confirm_delete", "confirm_delete_batch", updated)
         else:
-            # No tool calls — stream all the buffered text
-            for t in buffered:
-                yield sse("token", {"content": t})
+            # Tokens already streamed above — just finalize
             updated.append({"role": "assistant", "content": follow_content})
             yield sse("done", {"history": updated})
 
@@ -206,13 +273,39 @@ def _redirect_uri():
 
 # ── Calendar ─────────────────────────────────────────────────────
 
+_cal_cache = {}  # keyed by token hash → (service, creds)
+
 def _cal(token_str=None):
-    from googleapiclient.discovery import build
+    global _req_timer
     t = token_str or _token()
     if not t: raise Exception("Not authenticated. Please reconnect Google Calendar.")
+
+    cache_key = hash(t)
+    if cache_key in _cal_cache:
+        service, creds = _cal_cache[cache_key]
+        if not creds.expired:
+            if _req_timer:
+                _req_timer.record("_cal (cached)", 0.0)
+            return service
+
+    t0 = time.perf_counter()
     creds = _creds(json.loads(t))
-    if creds.expired and creds.refresh_token: creds.refresh(Request())
-    return build("calendar", "v3", credentials=creds)
+    if creds.expired and creds.refresh_token:
+        rt0 = time.perf_counter()
+        creds.refresh(Request())
+        if _req_timer:
+            _req_timer.record("creds.refresh", time.perf_counter() - rt0)
+
+    bt0 = time.perf_counter()
+    service = build("calendar", "v3", credentials=creds, cache_discovery=True)
+    if _req_timer:
+        _req_timer.record("discovery.build", time.perf_counter() - bt0)
+
+    _cal_cache[cache_key] = (service, creds)
+    total = time.perf_counter() - t0
+    if _req_timer:
+        _req_timer.record("_cal total (built)", total)
+    return service
 
 def create_calendar_event(summary, start_datetime, end_datetime, description="", location="", _token=None):
     event = {"summary": summary, "start": {"dateTime": start_datetime, "timeZone": TZ},
@@ -303,6 +396,8 @@ def auth_logout():
 
 @app.route("/api/chat", methods=["POST"])
 def chat():
+    global _req_timer
+    _req_timer = RequestTimer("POST /api/chat")
     data = request.json
     msg = data.get("message", "").strip()
     history = data.get("history", [])
@@ -310,10 +405,13 @@ def chat():
     history.append({"role": "user", "content": msg})
     messages = [sys_msg()] + history[-20:]
     token = _token()
+    timer = _req_timer
     def generate():
+        global _req_timer
+        _req_timer = timer
         try:
             content, tcs = "", {}
-            for typ, payload in stream_with_tools(messages):
+            for typ, payload in stream_with_tools(messages, label="primary LLM"):
                 if typ == "tok":
                     content += payload
                     yield sse("token", {"content": payload})
@@ -327,53 +425,81 @@ def chat():
         except Exception as e:
             yield sse("token", {"content": f"Error: {e}"})
             yield sse("done", {"history": history})
+        finally:
+            timer.summary()
     return sse_response(generate())
 
 @app.route("/api/confirm", methods=["POST"])
 def confirm_event():
+    global _req_timer
+    _req_timer = RequestTimer("POST /api/confirm")
     data = request.json
     history, tc = data["history"], data["tool_call"]
     token = _token()
-    result = FUNCS[tc["name"]](**json.loads(tc["arguments"]), _token=token)
+    timer = _req_timer
+    with timer.span(f"{tc['name']} (Google API)"):
+        result = FUNCS[tc["name"]](**json.loads(tc["arguments"]), _token=token)
     history.append({"role": "tool", "tool_call_id": tc["id"], "content": json.dumps(result)})
     def generate():
+        global _req_timer
+        _req_timer = timer
         yield sse("tool_used", {"name": tc["name"]})
-        yield from stream_reply([sys_msg()] + history[-20:], history)
+        yield from stream_reply([sys_msg()] + history[-20:], history, label="confirm reply")
+        timer.summary()
     return sse_response(generate())
 
 @app.route("/api/confirm_batch", methods=["POST"])
 def confirm_batch():
+    global _req_timer
+    _req_timer = RequestTimer("POST /api/confirm_batch")
     data = request.json
     history = data["history"]
     token = _token()
+    timer = _req_timer
     for tc in data.get("tool_calls", []):
-        r = FUNCS[tc["name"]](**json.loads(tc["arguments"]), _token=token)
+        with timer.span(f"{tc['name']} (Google API)"):
+            r = FUNCS[tc["name"]](**json.loads(tc["arguments"]), _token=token)
         history.append({"role": "tool", "tool_call_id": tc["id"], "content": json.dumps(r)})
     for tc in data.get("rejected_tool_calls", []):
         history.append({"role": "tool", "tool_call_id": tc["id"],
                         "content": json.dumps({"status": "cancelled", "reason": "User declined."})})
     def generate():
+        global _req_timer
+        _req_timer = timer
         yield sse("tool_used", {"name": data["tool_calls"][0]["name"] if data.get("tool_calls") else "batch"})
-        yield from stream_reply([sys_msg()] + history[-20:], history)
+        yield from stream_reply([sys_msg()] + history[-20:], history, label="batch reply")
+        timer.summary()
     return sse_response(generate())
 
 @app.route("/api/reject", methods=["POST"])
 def reject_event():
+    global _req_timer
+    _req_timer = RequestTimer("POST /api/reject")
     data = request.json
     history = data["history"]
     history.append({"role": "tool", "tool_call_id": data["tool_call"]["id"],
                     "content": json.dumps({"status": "cancelled", "reason": "User declined."})})
+    timer = _req_timer
     def generate():
-        yield from stream_reply([sys_msg()] + history[-20:], history)
+        global _req_timer
+        _req_timer = timer
+        yield from stream_reply([sys_msg()] + history[-20:], history, label="reject reply")
+        timer.summary()
     return sse_response(generate())
 
 @app.route("/api/reject_batch", methods=["POST"])
 def reject_batch():
+    global _req_timer
+    _req_timer = RequestTimer("POST /api/reject_batch")
     data = request.json
     history = data["history"]
     for tc in data.get("tool_calls", []):
         history.append({"role": "tool", "tool_call_id": tc["id"],
                         "content": json.dumps({"status": "cancelled", "reason": "User declined."})})
+    timer = _req_timer
     def generate():
-        yield from stream_reply([sys_msg()] + history[-20:], history)
+        global _req_timer
+        _req_timer = timer
+        yield from stream_reply([sys_msg()] + history[-20:], history, label="reject_batch reply")
+        timer.summary()
     return sse_response(generate())
