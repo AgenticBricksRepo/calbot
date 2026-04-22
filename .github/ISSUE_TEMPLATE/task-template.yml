@@ -19,12 +19,17 @@ body:
     id: type
     attributes:
       label: Issue Type
+      description: What kind of work is this?
       options:
-        - Feature
-        - Bug
-        - Chore
-        - Docs
-        - Spike
+        - New Feature
+        - Bug Fix
+        - Improvement
+        - UI / UX Change
+        - API Change
+        - Infrastructure
+        - Security Fix
+        - Documentation
+        - Research / Investigation
     validations:
       required: true
 
@@ -52,6 +57,7 @@ body:
     id: acceptance
     attributes:
       label: Acceptance Criteria
+      description: How do we know this is done?
       placeholder: |
         - [ ] Criteria 1
         - [ ] Criteria 2
@@ -62,6 +68,6 @@ body:
     id: notes
     attributes:
       label: Additional Notes
-      description: Links to designs, related issues, dependencies
+      description: Links to designs, related issues, or dependencies
     validations:
       required: false
