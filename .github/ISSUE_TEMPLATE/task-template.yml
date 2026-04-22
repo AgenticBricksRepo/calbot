@@ -1,5 +1,5 @@
 ---
-name: "U0001F9F1 AgenticBricks Task"
+name: AgenticBricks Task
 description: Create a task, feature, bug or chore for the Sprint Board
 title: "[TYPE] Brief description"
 projects: ["AgenticBricksRepo/1"]
@@ -8,7 +8,7 @@ body:
   - type: dropdown
     id: project
     attributes:
-      label: "U0001F4C2 Project"
+      label: Project
       description: Which project does this belong to?
       options:
         - StMarys
@@ -18,31 +18,31 @@ body:
   - type: dropdown
     id: type
     attributes:
-      label: "U0001F3F7 Issue Type"
+      label: Issue Type
       options:
-        - "❖ Feature"
-        - "⚠ Bug"
-        - "U0001F527 Chore"
-        - "U0001F4C4 Docs"
-        - "U0001F50D Spike"
+        - Feature
+        - Bug
+        - Chore
+        - Docs
+        - Spike
     validations:
       required: true
 
   - type: dropdown
     id: priority
     attributes:
-      label: "U0001F6A6 Priority"
+      label: Priority
       options:
-        - "U0001F534 High"
-        - "U0001F7E1 Medium"
-        - "U0001F7E2 Low"
+        - High
+        - Medium
+        - Low
     validations:
       required: true
 
   - type: textarea
     id: description
     attributes:
-      label: "U0001F4DD Description"
+      label: Description
       description: What needs to be done and why?
       placeholder: Describe the task clearly...
     validations:
@@ -51,7 +51,7 @@ body:
   - type: textarea
     id: acceptance
     attributes:
-      label: "✅ Acceptance Criteria"
+      label: Acceptance Criteria
       placeholder: |
         - [ ] Criteria 1
         - [ ] Criteria 2
@@ -61,7 +61,7 @@ body:
   - type: textarea
     id: notes
     attributes:
-      label: "U0001F517 Additional Notes"
+      label: Additional Notes
       description: Links to designs, related issues, dependencies
     validations:
       required: false
