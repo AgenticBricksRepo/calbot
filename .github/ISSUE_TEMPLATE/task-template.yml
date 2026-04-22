@@ -1,0 +1,67 @@
+---
+name: "U0001F9F1 AgenticBricks Task"
+description: Create a task, feature, bug or chore for the Sprint Board
+title: "[TYPE] Brief description"
+projects: ["AgenticBricksRepo/1"]
+labels: []
+body:
+  - type: dropdown
+    id: project
+    attributes:
+      label: "U0001F4C2 Project"
+      description: Which project does this belong to?
+      options:
+        - StMarys
+    validations:
+      required: true
+
+  - type: dropdown
+    id: type
+    attributes:
+      label: "U0001F3F7 Issue Type"
+      options:
+        - "❖ Feature"
+        - "⚠ Bug"
+        - "U0001F527 Chore"
+        - "U0001F4C4 Docs"
+        - "U0001F50D Spike"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: priority
+    attributes:
+      label: "U0001F6A6 Priority"
+      options:
+        - "U0001F534 High"
+        - "U0001F7E1 Medium"
+        - "U0001F7E2 Low"
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: "U0001F4DD Description"
+      description: What needs to be done and why?
+      placeholder: Describe the task clearly...
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: "✅ Acceptance Criteria"
+      placeholder: |
+        - [ ] Criteria 1
+        - [ ] Criteria 2
+    validations:
+      required: false
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: "U0001F517 Additional Notes"
+      description: Links to designs, related issues, dependencies
+    validations:
+      required: false
