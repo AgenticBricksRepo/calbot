@@ -3,17 +3,7 @@ name: AgenticBricks Task
 description: Create a task, feature, bug or chore for the Sprint Board
 title: "[TYPE] Brief description"
 projects: ["AgenticBricksRepo/1"]
-assignees: []
 body:
-  - type: input
-    id: assignee
-    attributes:
-      label: Assigned To
-      description: GitHub username of the person responsible (e.g. johndoe)
-      placeholder: Enter GitHub username
-    validations:
-      required: true
-
   - type: dropdown
     id: project
     attributes:
